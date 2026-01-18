@@ -5,21 +5,29 @@ import os
 import subprocess
 import glob
 import shutil
+from pydantic import BaseModel
 from utils.prompt_generator import generate_prompt_according_image
 from utils.extract import extract_json
 from utils.generate_single_image import ImageGenerator, app as app_qwen
-from utils.generate_stability_diffusion import StabilityDiffusionXLImageGenerator, app as app_sdxl
 from constants import ASPECT_RATIO
 
 app = modal.App("new-orchestrator")
 
+# Include the other apps so we can call their functions
 app.include(app_qwen)
-app.include(app_sdxl)
+
+# Define the request model for JSON input
+class GenerateRequest(BaseModel):
+    url: str
+    mode: str = "pfp"  # Default to pfp if not provided
+    count: str
+    user_input: str
+    style: str | None = None
 
 image = (
     modal.Image.debian_slim()
-    .apt_install("git")
-    .pip_install("fastapi", "openai", "python-dotenv", "gallery-dl")
+    .apt_install("git", "ffmpeg") # ffmpeg is often needed for gallery-dl
+    .pip_install("fastapi", "openai", "python-dotenv", "gallery-dl", "boto3")
     .add_local_dir("utils", remote_path="/root/utils", copy=True)
     .add_local_file("constants.py", remote_path="/root/constants.py", copy=True)
 )
@@ -45,72 +53,126 @@ def download_image(url: str, output_dir: str = "/tmp/downloads") -> str:
         print(f"Error downloading image: {e.stderr.decode()}")
         raise RuntimeError(f"Failed to download image from {url}")
 
+    # Find the downloaded file
     files = glob.glob(f"{output_dir}/**/*", recursive=True)
-    files = [f for f in files if os.path.isfile(f)]
+    
+    # Filter for valid image extensions to avoid json/txt metadata files
+    valid_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+    files = [f for f in files if os.path.isfile(f) and f.lower().endswith(valid_extensions)]
     
     if not files:
         raise FileNotFoundError("No image found after download.")
     
     return files[0]
 
-@app.function(image=image, secrets=[modal.Secret.from_dotenv()])
-@modal.fastapi_endpoint(method="POST")
-def generate_art(url: str, mode: str = "pfp"):
-    """
-    Generate art based on an input URL (e.g. Pinterest).
-    
-    Args:
-        url (str): The URL of the reference image.
-        mode (str): "pfp" for Profile Pictures (uses Qwen) or "mobile" for Wallpapers (uses SDXL).
-    """
+
+
+# Separate function for the heavy processing
+@app.function(image=image, secrets=[modal.Secret.from_dotenv()], timeout=600)
+def generate_art_process(item: GenerateRequest):
+    # Extract data from Pydantic model
+    url = item.url
+    mode = item.mode.lower()
+    count = item.count
+    user_input = item.user_input
+    style = item.style
+
     start_time = time.perf_counter()
     
+    # 1. Download Image
     try:
         downloaded_path = download_image(url)
         print(f"✅ Image downloaded to: {downloaded_path}")
     except Exception as e:
-        return {"error": str(e)}
+        print(f"Error downloading image: {e}")
+        return
 
     with open(downloaded_path, "rb") as f:
         image_bytes = f.read()
 
-    print(f"🧠 Generating prompt variants for mode: {mode}...")
-    llm_start = time.perf_counter()
-    
-    prompt_type = "profile" if mode.lower() == "pfp" else "wallpaper"
-    prompt_json_str = asyncio.run(generate_prompt_according_image(image_bytes, type=prompt_type))
-    prompt_data = extract_json(prompt_json_str)
-    print("Prompt Data:", prompt_data)
-    llm_duration = time.perf_counter() - llm_start
-
-    if mode.lower() == "pfp":
-        target_ratio = ASPECT_RATIO["1:1"]
+    # 2. Determine Settings based on Mode
+    if mode == "pfp":
+        prompt_type = "profile"
+        target_ratio = ASPECT_RATIO.get("1:1", "1:1")
         generator_class = ImageGenerator
         generator_name = "Qwen (PFP)"
-    else: 
-        target_ratio = ASPECT_RATIO["9:16"]
-        generator_class = StabilityDiffusionXLImageGenerator
-        generator_name = "SDXL (Mobile Wallpaper)"
+        
+    elif mode == "mobile": 
+        prompt_type = "mobile"
+        target_ratio = ASPECT_RATIO.get("9:16", "9:16")
+        generator_class = ImageGenerator
+        generator_name = "Qwen (Mobile Wallpaper)"
+        
+    elif mode == "desktop":
+        prompt_type = "desktop"
+        target_ratio = ASPECT_RATIO.get("16:9", "16:9")
+        generator_class = ImageGenerator
+        generator_name = "Qwen (Desktop)"
+        
+    else:
+        # Fallback default
+        prompt_type = "Regular"
+        target_ratio = ASPECT_RATIO.get("1:1", "1:1")
+        generator_class = ImageGenerator
+        generator_name = "Qwen (Default)"
+
+    # 3. Generate Prompts (Async)
+    print(f"🧠 Generating distinct prompt variants for mode: {mode}...")
+    llm_start = time.perf_counter()
+    
+    prompt_json_str = asyncio.run(generate_prompt_according_image(
+        image_bytes, 
+        count=count, 
+        type=prompt_type, 
+        user_input=user_input,
+        style=style
+    ))
+    prompt_data = extract_json(prompt_json_str)
+    
+    llm_duration = time.perf_counter() - llm_start
+    
+    variants = prompt_data.get("variants", [])
+    print(f"Generated {len(variants)} variants.")
 
     map_inputs = [
-        (target_ratio, variant["prompt"]) 
-        for variant in prompt_data["variants"]
+        (target_ratio, variant["prompt"], variant.get("category", "uncategorized")) 
+        for variant in variants
     ]
 
+    # 4. Generate Images
     gpu_start = time.perf_counter()
     print(f"🎨 Generating images with {generator_name}...")
     
+    if not map_inputs:
+        print("No prompts were generated by the LLM.")
+        return
+
+    # .map runs generations in parallel
     results = list(generator_class().generate.map(map_inputs))
     
     gpu_duration = time.perf_counter() - gpu_start
-
     total_duration = time.perf_counter() - start_time
-    print("\n" + "="*40)
+
     print(f"🏁 GENERATION COMPLETE ({mode})")
-    print(f"⏱️  LLM Prompting: {llm_duration:.2f}s")
-    print(f"⏱️  GPU Run ({generator_name}): {gpu_duration:.2f}s")
-    print(f"⏱️  Total Pipeline: {total_duration:.2f}s")
-    print(f"📈 Output: {results}")
-    print("="*40)
     
-    return {"mode": mode, "generator": generator_name, "results": results}
+    # 5. Print Results
+    print(f"✅ Generated {len(results)} images:")
+    for res in results:
+        print(f" - {res}")
+
+
+# Fast endpoint that spawns the background task
+@app.function(image=image, secrets=[modal.Secret.from_dotenv()], timeout=60)
+@modal.fastapi_endpoint(method="POST")
+def generate_art(item: GenerateRequest):
+    """
+    Generate art based on an input URL.
+    Returns immediately and processes in background.
+    """
+    # Spawn the background process
+    generate_art_process.spawn(item)
+    
+    return {
+        "status": "processing",
+        "message": "Art generation started in background. Check back shortly."
+    }
